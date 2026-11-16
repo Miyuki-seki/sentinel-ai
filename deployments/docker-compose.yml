@@ -1,0 +1,24 @@
+services:
+  mock-target:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile.target
+    ports:
+      - "8081:8081"
+
+  monitor:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile.monitor
+    ports:
+      - "8080:8080"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - TARGET_URL=http://mock-target:8081/health
+      - CHECK_INTERVAL_SEC=5
+      - PORT=8080
+      - DB_PATH=/app/data/sentinel.db
+    volumes:
+      - ../data:/app/data
+    depends_on:
+      - mock-target
