@@ -76,8 +76,12 @@ func main() {
 		_ = json.NewEncoder(w).Encode(map[string]string{"mode": mode})
 	})
 
-	logger.Info("mock-target listening", "addr", ":8081")
-	if err := http.ListenAndServe(":8081", mux); err != nil {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8081"
+	}
+	logger.Info("mock-target listening", "addr", ":"+port)
+	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		logger.Error("server failed", "err", err)
 		os.Exit(1)
 	}
