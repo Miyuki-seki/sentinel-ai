@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
 	"google.golang.org/genai"
@@ -23,9 +24,14 @@ func NewGeminiAnalyzer(ctx context.Context, apiKey string) (*GeminiAnalyzer, err
 		return nil, fmt.Errorf("init genai client: %w", err)
 	}
 
+	model := os.Getenv("GEMINI_MODEL")
+	if model == "" {
+		model = "gemini-3.8-flash"
+	}
+
 	return &GeminiAnalyzer{
 		client: client,
-		model:  "gemini-2.5-flash",
+		model:  model,
 	}, nil
 }
 
