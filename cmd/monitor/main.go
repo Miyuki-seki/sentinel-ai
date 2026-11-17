@@ -29,6 +29,10 @@ func main() {
 	apiKey := os.Getenv("GEMINI_API_KEY")
 	discordWebhookURL := os.Getenv("DISCORD_WEBHOOK_URL")
 
+	probeRetentionHours, _ := strconv.Atoi(getEnv("PROBE_LOG_RETENTION_HOURS", "24"))
+	incidentRetentionDays, _ := strconv.Atoi(getEnv("INCIDENT_RETENTION_DAYS", "30"))
+	cleanupIntervalMin, _ := strconv.Atoi(getEnv("CLEANUP_INTERVAL_MIN", "60"))
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -66,6 +70,15 @@ func main() {
 		logger.Info("starting independent prober", "url", targetURL, "interval_sec", intervalSec)
 		go runProber(ctx, logger, dbStore, aiAnalyzer, discordNotifier, targetURL, interval)
 	}
+
+	go runCleanupWorker(
+		ctx,
+		logger,
+		dbStore,
+		time.Duration(probeRetentionHours)*time.Hour,
+		time.Duration(incidentRetentionDays)*24*time.Hour,
+		time.Duration(cleanupIntervalMin)*time.Minute,
+	)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
@@ -272,4 +285,54 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func runCleanupWorker(
+	ctx context.Context,
+	logger *slog.Logger,
+	dbStore *store.SQLiteStore,
+	probeRetention time.Duration,
+	incidentRetention time.Duration,
+	cleanupInterval time.Duration,
+) {
+	if cleanupInterval <= 0 {
+		cleanupInterval = 1 * time.Hour
+	}
+
+	clean := func() {
+		logger.Debug("starting periodic log cleanup...")
+		deletedProbes, err := dbStore.CleanupProbeLogs(probeRetention)
+		if err != nil {
+			logger.Error("failed to cleanup probe logs", "err", err)
+		}
+
+		deletedIncidents, err := dbStore.CleanupResolvedIncidents(incidentRetention)
+		if err != nil {
+			logger.Error("failed to cleanup resolved incidents", "err", err)
+		}
+
+		if deletedProbes > 0 || deletedIncidents > 0 {
+			logger.Info("periodic log cleanup completed",
+				"deleted_probe_logs", deletedProbes,
+				"deleted_resolved_incidents", deletedIncidents,
+				"probe_retention", probeRetention,
+				"incident_retention", incidentRetention,
+			)
+		}
+	}
+
+	// 起動時初回実行
+	clean()
+
+	ticker := time.NewTicker(cleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			clean()
+		}
+	}
 }

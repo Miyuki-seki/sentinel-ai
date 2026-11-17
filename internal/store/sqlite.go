@@ -79,6 +79,9 @@ func migrate(db *sql.DB) error {
 		created_at DATETIME NOT NULL,
 		resolved_at DATETIME
 	);
+
+	CREATE INDEX IF NOT EXISTS idx_probe_logs_created_at ON probe_logs(created_at);
+	CREATE INDEX IF NOT EXISTS idx_incidents_status_resolved_at ON incidents(status, resolved_at);
 	`
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate schema: %w", err)
@@ -170,3 +173,25 @@ func (s *SQLiteStore) ListRecentIncidents(limit int) ([]Incident, error) {
 	}
 	return list, rows.Err()
 }
+
+// CleanupProbeLogs removes probe records older than the specified retention duration.
+func (s *SQLiteStore) CleanupProbeLogs(retention time.Duration) (int64, error) {
+	threshold := time.Now().UTC().Add(-retention)
+	res, err := s.db.Exec(`DELETE FROM probe_logs WHERE created_at < ?`, threshold)
+	if err != nil {
+		return 0, fmt.Errorf("cleanup probe logs: %w", err)
+	}
+	return res.RowsAffected()
+}
+
+// CleanupResolvedIncidents removes resolved incident records whose resolved_at is older than retention duration.
+// OPEN incidents are preserved regardless of age.
+func (s *SQLiteStore) CleanupResolvedIncidents(retention time.Duration) (int64, error) {
+	threshold := time.Now().UTC().Add(-retention)
+	res, err := s.db.Exec(`DELETE FROM incidents WHERE status = 'RESOLVED' AND resolved_at IS NOT NULL AND resolved_at < ?`, threshold)
+	if err != nil {
+		return 0, fmt.Errorf("cleanup resolved incidents: %w", err)
+	}
+	return res.RowsAffected()
+}
+

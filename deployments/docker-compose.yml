@@ -27,6 +27,9 @@ services:
       - CHECK_INTERVAL_SEC=${CHECK_INTERVAL_SEC:-5}
       - PORT=${PORT:-8080}
       - DB_PATH=${DB_PATH:-/app/data/sentinel.db}
+      - PROBE_LOG_RETENTION_HOURS=${PROBE_LOG_RETENTION_HOURS:-24}
+      - INCIDENT_RETENTION_DAYS=${INCIDENT_RETENTION_DAYS:-30}
+      - CLEANUP_INTERVAL_MIN=${CLEANUP_INTERVAL_MIN:-60}
     volumes:
       - ../data:/app/data
     depends_on:
