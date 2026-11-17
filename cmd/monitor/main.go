@@ -9,21 +9,25 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/Miyuki-seki/sentinel-ai/internal/analyzer"
+	"github.com/Miyuki-seki/sentinel-ai/internal/notifier"
 	"github.com/Miyuki-seki/sentinel-ai/internal/store"
 )
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
-	targetURL := getEnv("TARGET_URL", "http://localhost:8081/health")
+	targetURLs := parseTargetURLs()
 	intervalSec, _ := strconv.Atoi(getEnv("CHECK_INTERVAL_SEC", "5"))
 	port := getEnv("PORT", "8080")
 	dbPath := getEnv("DB_PATH", "./data/sentinel.db")
 	apiKey := os.Getenv("GEMINI_API_KEY")
+	discordWebhookURL := os.Getenv("DISCORD_WEBHOOK_URL")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -49,7 +53,19 @@ func main() {
 		logger.Warn("GEMINI_API_KEY not set; using fallback analyzer")
 	}
 
-	go runProber(ctx, logger, dbStore, aiAnalyzer, targetURL, time.Duration(intervalSec)*time.Second)
+	var discordNotifier notifier.Notifier
+	if discordWebhookURL != "" {
+		discordNotifier = notifier.NewDiscordNotifier(discordWebhookURL)
+		logger.Info("discord webhook notifier enabled")
+	} else {
+		logger.Info("DISCORD_WEBHOOK_URL not set; notifications will be skipped")
+	}
+
+	interval := time.Duration(intervalSec) * time.Second
+	for _, targetURL := range targetURLs {
+		logger.Info("starting independent prober", "url", targetURL, "interval_sec", intervalSec)
+		go runProber(ctx, logger, dbStore, aiAnalyzer, discordNotifier, targetURL, interval)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
@@ -68,7 +84,7 @@ func main() {
 
 	srv := &http.Server{Addr: ":" + port, Handler: mux}
 	go func() {
-		logger.Info("monitor web server listening", "addr", srv.Addr, "target", targetURL)
+		logger.Info("monitor web server listening", "addr", srv.Addr, "targets", targetURLs)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("http server error", "err", err)
 		}
@@ -86,6 +102,7 @@ func runProber(
 	logger *slog.Logger,
 	dbStore *store.SQLiteStore,
 	aiAnalyzer analyzer.Analyzer,
+	discordNotifier notifier.Notifier,
 	url string,
 	interval time.Duration,
 ) {
@@ -93,7 +110,8 @@ func runProber(
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	consecutiveFailures := 0
+	var consecutiveFailures int
+	var isTriaging atomic.Bool
 
 	check := func() {
 		start := time.Now()
@@ -138,53 +156,81 @@ func runProber(
 			"err", errMsg,
 		)
 
-		// 2回連続失敗でインシデント化（既存のOPENインシデントがあれば重複起票しない）
+		// 2回連続失敗でインシデント化
 		if consecutiveFailures >= 2 {
 			hasOpen, err := dbStore.HasOpenIncident(url)
 			if err != nil || hasOpen {
 				return
 			}
 
-			logger.Info("triggering AI incident triage...", "url", url)
-			triageCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-			defer cancel()
-
-			report, err := aiAnalyzer.Analyze(triageCtx, analyzer.ProbeFailure{
-				TargetURL:  url,
-				StatusCode: statusCode,
-				LatencyMs:  latency,
-				RawBody:    bodyStr,
-				ErrMessage: errMsg,
-			})
-			if err != nil {
-				logger.Error("ai triage failed", "err", err)
+			// 既にトリアージ実行中であれば二重起動を防ぐ
+			if !isTriaging.CompareAndSwap(false, true) {
+				logger.Debug("triage already in progress, skipping duplicate run", "url", url)
 				return
 			}
 
-			sample := bodyStr
-			if sample == "" {
-				sample = errMsg
-			}
+			// プロービング周期をブロックしないよう、トリアージ処理を非同期で実行
+			go func(url string, sc int, lat int64, rawBody, errTxt string) {
+				defer isTriaging.Store(false)
 
-			id, err := dbStore.CreateIncident(store.Incident{
-				TargetURL:   url,
-				StatusCode:  statusCode,
-				ErrorSample: sample,
-				Summary:     report.Summary,
-				RootCause:   report.RootCause,
-				Severity:    report.Severity,
-				Remediation: report.Remediation,
-			})
-			if err != nil {
-				logger.Error("failed to save incident", "err", err)
-				return
-			}
+				logger.Info("triggering AI incident triage...", "url", url)
+				triageCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+				defer cancel()
 
-			logger.Info("AI incident report saved",
-				"incident_id", id,
-				"severity", report.Severity,
-				"summary", report.Summary,
-			)
+				report, err := aiAnalyzer.Analyze(triageCtx, analyzer.ProbeFailure{
+					TargetURL:  url,
+					StatusCode: sc,
+					LatencyMs:  lat,
+					RawBody:    rawBody,
+					ErrMessage: errTxt,
+				})
+				if err != nil {
+					logger.Error("ai triage failed", "url", url, "err", err)
+					return
+				}
+
+				sample := rawBody
+				if sample == "" {
+					sample = errTxt
+				}
+
+				inc := store.Incident{
+					TargetURL:   url,
+					StatusCode:  sc,
+					ErrorSample: sample,
+					Summary:     report.Summary,
+					RootCause:   report.RootCause,
+					Severity:    report.Severity,
+					Remediation: report.Remediation,
+					CreatedAt:   time.Now().UTC(),
+				}
+
+				id, err := dbStore.CreateIncident(inc)
+				if err != nil {
+					logger.Error("failed to save incident", "url", url, "err", err)
+					return
+				}
+				inc.ID = id
+
+				logger.Info("AI incident report saved",
+					"incident_id", id,
+					"url", url,
+					"severity", report.Severity,
+					"summary", report.Summary,
+				)
+
+				// Discord Webhook へ投稿
+				if discordNotifier != nil {
+					notifyCtx, notifyCancel := context.WithTimeout(ctx, 10*time.Second)
+					defer notifyCancel()
+
+					if err := discordNotifier.SendIncident(notifyCtx, inc); err != nil {
+						logger.Error("failed to send incident to discord", "url", url, "err", err)
+					} else {
+						logger.Info("incident posted to discord successfully", "url", url, "incident_id", id)
+					}
+				}
+			}(url, statusCode, latency, bodyStr, errMsg)
 		}
 	}
 
@@ -197,6 +243,28 @@ func runProber(
 			check()
 		}
 	}
+}
+
+func parseTargetURLs() []string {
+	raw := os.Getenv("TARGET_URLS")
+	if raw == "" {
+		raw = os.Getenv("TARGET_URL")
+	}
+	if raw == "" {
+		raw = "http://localhost:8081/health"
+	}
+
+	var urls []string
+	for _, u := range strings.Split(raw, ",") {
+		u = strings.TrimSpace(u)
+		if u != "" {
+			urls = append(urls, u)
+		}
+	}
+	if len(urls) == 0 {
+		return []string{"http://localhost:8081/health"}
+	}
+	return urls
 }
 
 func getEnv(key, fallback string) string {

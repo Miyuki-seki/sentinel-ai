@@ -48,6 +48,14 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 }
 
 func migrate(db *sql.DB) error {
+	pragmas := `
+	PRAGMA journal_mode=WAL;
+	PRAGMA busy_timeout=5000;
+	`
+	if _, err := db.Exec(pragmas); err != nil {
+		return fmt.Errorf("set pragmas: %w", err)
+	}
+
 	schema := `
 	CREATE TABLE IF NOT EXISTS probe_logs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
