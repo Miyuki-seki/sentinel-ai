@@ -1,50 +1,62 @@
 # Sentinel-AI
 
-Sentinel-AI は、Web サービスや API エンドポイントのヘルスチェック（外形監視）を行い、障害検知時に **Gemini API** を活用して自動トリアージおよび根本原因分析・復旧手順の提案を行う AI 搭載監視エージェントです。
+Sentinel-AI は、複数の Web サービスや API エンドポイントのヘルスチェック（外形監視）を並行して行い、障害検知時に **Gemini API** を活用して自動トリアージ・根本原因分析・復旧手順の提案を生成し、**Discord Webhook** へ通知する AI 搭載監視エージェントです。
 
 ---
 
 ## 主な機能
 
-1. **自動プロービング & メトリクス記録**
-   - 設定されたインターバル（デフォルト 5 秒）で監視対象エンドポイントのヘルスチェックを実行。
-   - レイテンシ（ms）、ステータスコード、死活状態を SQLite に自動記録。
-2. **AI によるインシデント自動トリアージ (Gemini 2.5 Flash)**
-   - 連続障害（2回連続失敗）を検知すると、HTTP ステータスやレスポンスボディ、エラーログを Gemini API へ連携。
+1. **複数ターゲットの完全独立・並行プロービング**
+   - カンマ区切りで複数のターゲット URL を指定可能（`TARGET_URLS`）。
+   - ターゲットごとに独立した Goroutine で監視を実行し、定期インターバル（デフォルト 5 秒）でヘルスチェックを行います。
+2. **AI によるインシデント自動トリアージ (Gemini 3.8 Flash)**
+   - 対象エンドポイントで連続 2 回の障害を検知すると、HTTP ステータスやレスポンスボディ、エラーログを Gemini API へ自動連携。
    - 障害の要約 (`summary`)、推定原因 (`root_cause`)、重大度 (`severity`)、具体的な復旧コマンド (`remediation`) を構造化 JSON で自動生成。
-3. **インシデントの自動クローズ（自己回復検知）**
+3. **ノンブロッキング監視アーキテクチャ**
+   - あるターゲットで Gemini トリアージ（LLM 推論）が実行されている最中も、バックグラウンド Goroutine で処理されるため、正常稼働している他のターゲットの 5 秒周期プロービングは一切ブロックされず継続します。
+4. **Discord Webhook への自動インシデント通知**
+   - インシデント発生時、Gemini が生成したトリアージレポート（重大度カラーリング、推定原因、復旧手順、エラーサンプル）を Discord チャンネルへリッチな Embed 形式で即時投稿。
+5. **インシデントの自動クローズ（自己回復検知）**
    - 監視対象が正常ステータスに復帰すると、未解決（`OPEN`）のインシデントを自動的に `RESOLVED` へ遷移。
-4. **障害シミュレーション用モックターゲット同梱**
-   - DB コネクション枯渇エラーやレイテンシ遅延を再現可能なモックサーバーが付属し、すぐにトリアージ動作を検証可能。
-5. **CGO 不要のピュア Go 構成**
-   - `modernc.org/sqlite` を採用し、CGO なしで SQLite を利用可能。
+6. **障害シミュレーション用モックターゲット同梱**
+   - DB コネクション枯渇エラーやレイテンシ遅延を再現可能なモックサーバーが付属し、すぐにトリアージ動作や通知を検証可能。
+7. **CGO 不要のピュア Go 構成**
+   - `modernc.org/sqlite` を採用し、WAL モードによる並行読み書き耐性を備えています。
 
 ---
 
 ## システム構成・ワークフロー
 
 ```
-+-------------------------------------------------------------+
-|                        Sentinel-AI                          |
-|                                                             |
-|  +----------------+     Health Probe     +---------------+  |
-|  |                | -------------------> |  Target App   |  |
-|  |     Prober     |                      | (mock-target) |  |
-|  |                | <------------------- +---------------+  |
-|  +-------+--------+     Status/Latency                      |
-|          |                                                  |
-|          | (Log & Metrics)                                  |
-|          v                                                  |
-|  +----------------+                                         |
-|  |  SQLite Store  |                                         |
-|  +-------+--------+                                         |
-|          ^                                                  |
-|          | (Save Incident)                                  |
-|  +-------+--------+       Analyze Failure    +------------+ |
-|  |   AI Analyzer  | -----------------------> | Gemini API | |
-|  |                | <----------------------- +------------+ |
-|  +----------------+    Structured Triage                    |
-+-------------------------------------------------------------+
++--------------------------------------------------------------------------------+
+|                                  Sentinel-AI                                   |
+|                                                                                |
+|  +-------------------+       Health Probe (5s)      +------------------------+ |
+|  |                   | ---------------------------> | Target 1 (mock-target) | |
+|  |                   |                              +------------------------+ |
+|  |  Prober Workers   |                                                         |
+|  | (Goroutine / URL) |       Health Probe (5s)      +------------------------+ |
+|  |                   | ---------------------------> | Target 2 (Service B)   | |
+|  +---------+---------+                              +------------------------+ |
+|            |                                                                   |
+|            | (Log & Latency Metrics)                                           |
+|            v                                                                   |
+|  +-------------------+                                                         |
+|  | SQLite Store(WAL) |                                                         |
+|  +---------+---------+                                                         |
+|            ^                                                                   |
+|            | (Async Save Incident)                                             |
+|  +---------+---------+        Analyze Failure       +------------------------+ |
+|  |    AI Analyzer    | ---------------------------> |       Gemini API       | |
+|  |  (Non-blocking)   | <--------------------------- +------------------------+ |
+|  +---------+---------+       Structured Triage                                 |
+|            |                                                                   |
+|            | (Webhook POST / Embed)                                            |
+|            v                                                                   |
+|  +-------------------+                                                         |
+|  |  Discord Notifier | ---------------------------> Discord Channel            |
+|  +-------------------+                                                         |
++--------------------------------------------------------------------------------+
 ```
 
 ---
@@ -58,6 +70,7 @@ Sentinel-AI は、Web サービスや API エンドポイントのヘルスチ�
 │   └── mock-target/      # 障害シミュレーション用モックサーバー
 ├── internal/
 │   ├── analyzer/         # Gemini 連携およびトリアージ解析ロジック
+│   ├── notifier/         # Discord Webhook 等の通知クライアント
 │   └── store/            # SQLite データベース操作ロジック
 ├── deployments/
 │   ├── Dockerfile.monitor
@@ -75,6 +88,7 @@ Sentinel-AI は、Web サービスや API エンドポイントのヘルスチ�
 - Docker / Docker Compose
 - (ローカル直接実行の場合) Go 1.24 以上
 - Google Gemini API キー（未設定時はモックの Fallback トリアージが動作）
+- (任意) Discord Webhook URL
 
 ---
 
@@ -89,12 +103,13 @@ cp .env.example .env
 | 変数名 | 説明 | デフォルト値 |
 | :--- | :--- | :--- |
 | `GEMINI_API_KEY` | Gemini API のアクセスキー | - |
-| `TARGET_URL` | 監視対象のヘルスチェック URL | `http://mock-target:8081/health` |
-| `CHECK_INTERVAL_SEC` | ヘルスチェックの実行間隔（秒） | `5` |
+| `GEMINI_MODEL` | 使用する Gemini モデル | `gemini-3.8-flash` |
+| `TARGET_URLS` | 監視対象 URL（カンマ区切りで複数指定可能） | `http://mock-target-1:8081/health,http://mock-target-2:8081/health` |
+| `TARGET_URL` | 後方互換用（`TARGET_URLS` 未設定時に参照） | `http://mock-target:8081/health` |
+| `DISCORD_WEBHOOK_URL` | 通知先 Discord Webhook URL（未設定時は通知スキップ） | - |
+| `CHECK_INTERVAL_SEC` | 各ターゲットのヘルスチェック間隔（秒） | `5` |
 | `PORT` | 監視サーバーの公開ポート | `8080` |
 | `DB_PATH` | SQLite データベースファイルの保存先 | `/app/data/sentinel.db` |
-
-> **Note**: `GEMINI_API_KEY` を設定しない場合やサンプルのまま起動した場合は、内蔵の `FallbackAnalyzer` が適用され、ローカル完結で動作確認できます。
 
 ---
 
@@ -118,72 +133,55 @@ make down
 
 ---
 
-## 動作確認・障害シミュレーション手順
+## 動作確認・複数ターゲット障害シミュレーション手順
 
 ### 1. 正常稼働の確認
 
-監視サーバーおよびモックサーバーの稼働を確認します。
+監視サーバーおよび 2 つのモックターゲットの稼働を確認します。
 
 ```bash
 # 監視サーバー
 curl http://localhost:8080/
 # => Sentinel-AI Monitor is running. Check GET /api/incidents for JSON reports.
 
-# モックターゲット
+# モックターゲット 1 (ポート 8081)
 curl http://localhost:8081/health
+# => {"status":"healthy"}
+
+# モックターゲット 2 (ポート 8082)
+curl http://localhost:8082/health
 # => {"status":"healthy"}
 ```
 
-### 2. 障害のシミュレーション (DB 接続枯渇)
+### 2. 片方のターゲットで障害をシミュレーション
 
-モックサーバーに対して `mode=error` を送信し、障害状態を発生させます。
+Target 1（ポート 8081）にのみ `mode=error` を送信して障害を発生させます。
 
 ```bash
 curl -X POST "http://localhost:8081/simulate?mode=error"
 ```
 
-監視ログで 2 回連続の失敗検知後、Gemini による自動トリアージが実行されます。
+- **ログの確認 (`make logs`)**:
+  - Target 1 は連続失敗検知によりバックグラウンドで **Gemini AI トリアージ**（および Discord 通知）がトリガーされます。
+  - **重要**: Target 1 のトリアージ中であっても、正常な Target 2（ポート 8082）は一切止まることなく **5 秒ごとの監視プローブ（`probe ok`）が継続**されます。
 
 ### 3. トリアージ結果 (インシデント) の確認
 
-監視サーバーの API エンドポイントから生成されたインシデントレポートを取得できます。
+監視サーバーの API エンドポイントから、Target 1 に関するインシデントレポートを取得できます。
 
 ```bash
 curl -s http://localhost:8080/api/incidents | jq .
 ```
 
-**インシデント JSON の出力例:**
+### 4. ターゲット 1 の復旧
 
-```json
-[
-  {
-    "id": 1,
-    "target_url": "http://mock-target:8081/health",
-    "status": "OPEN",
-    "status_code": 500,
-    "error_sample": "{\"error\":\"FATAL: remaining connection slots are reserved for superuser (SQLSTATE 53300)\",\"status\":\"unhealthy\"}\n",
-    "summary": "Health check failed with 500 Internal Server Error due to PostgreSQL connection exhaustion",
-    "root_cause": "PostgreSQL connection pool exhausted (SQLSTATE 53300) preventing new database sessions.",
-    "severity": "CRITICAL",
-    "remediation": [
-      "Check active DB connections: SELECT count(*) FROM pg_stat_activity;",
-      "Inspect container logs: docker logs sentinel-ai-mock-target-1",
-      "Restart target service or increase max_connections / connection pool limits"
-    ],
-    "created_at": "2026-11-17T02:30:00Z"
-  }
-]
-```
-
-### 4. サービスの復旧
-
-モックサーバーを通常状態（`mode=ok`）に戻します。
+Target 1 を通常状態（`mode=ok`）に戻します。
 
 ```bash
 curl -X POST "http://localhost:8081/simulate?mode=ok"
 ```
 
-次回のプローブ成功時に、対象インシデントの `status` が自動的に `RESOLVED` へ更新されます。
+次回のプローブ成功時に、Target 1 の未解決インシデントが自動的に `RESOLVED` に更新されます。
 
 ---
 
